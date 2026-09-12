@@ -5,6 +5,9 @@
 输入用 Gerber RS-274X + Excellon 钻孔——Altium、立创EDA、KiCad 等所有 EDA 都能导出，
 是事实上的通用格式。输出 STL（打印用）和 STEP（给 CAD/CNC 用）。
 
+支持**孔径宏（`%AM%`）**：圆角矩形、椭圆、自定义轮廓这些，立创EDA 的 IC 焊盘和
+Protel/Altium 系的封装全靠它。宏里写死的小数、`$n` 变量、英寸/毫米单位都能正确处理。
+
 ## 直接用（推荐）
 
 下载 `dist/钢网治具生成器.exe`（或到 Release 页面下载），双击打开：

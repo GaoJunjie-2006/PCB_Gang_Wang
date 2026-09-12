@@ -271,10 +271,22 @@ def min_dimension(poly: Polygon) -> float:
     焊盘那么大（1.8x1.2），可壁只剩 0.05mm——外接矩形永远看不出这种薄壁，
     结果就是一条印不出来的细环被当成合格开孔，还把里面那块料围成孤岛。
     最大内切圆对环形、C 形都能正确给出壁厚。
+
+    注意凹角：C 形开口内侧那个角上能塞进比臂宽更大的圆（实测 1.17 vs 臂宽
+    1.0），"最细处"和"臂宽"本来就不是一回事。这里要的是最细处——它决定能
+    不能印出来。
     """
+    if poly is None or poly.is_empty or poly.area <= 0:
+        return 0.0
+    # shapely 2.1+ 有原生实现，返回圆心到最近边界的线段，长度就是内切圆半径。
+    # 比下面二分快一个数量级（实测 123 个图元 0.25s vs 3.0s），结果一致。
+    mic = getattr(shapely, "maximum_inscribed_circle", None)
+    if mic is not None and poly.geom_type == "Polygon":
+        try:
+            return 2.0 * mic(poly).length
+        except Exception:
+            pass                                  # 退到二分
     try:
-        if poly is None or poly.is_empty or poly.area <= 0:
-            return 0.0
         # 内切圆半径不可能超过 sqrt(面积/π)，拿它当上界
         lo, hi = 0.0, math.sqrt(poly.area / math.pi)
         if not poly.buffer(-hi).is_empty:
@@ -309,6 +321,8 @@ def snap_geom(geom, grid: float = 1e-4):
 # ----------------------------------------------------------------------------
 
 _WORD_RE = re.compile(r"([A-Za-z])([+-]?[0-9]*)")
+# 宏参数里的数字：1 / 1.5 / .5 / 1. / 1e-5 都要认
+_NUM_RE = r"(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?"
 _ADD_RE = re.compile(r"^ADD(\d+)([A-Za-z_$.][A-Za-z0-9_$.\-]*)(?:,(.*))?$", re.S)
 _AM_RE = re.compile(r"^AM([A-Za-z0-9_$.\-]+)\*?(.*)$", re.S)
 
@@ -316,7 +330,11 @@ _AM_RE = re.compile(r"^AM([A-Za-z0-9_$.\-]+)\*?(.*)$", re.S)
 def _eval_expr(expr: str, variables: dict) -> float:
     """宏参数表达式求值：支持 + - x / ( ) 和 $n 变量（自己写，避免 eval 风险）"""
     s = expr.replace("$", " $")
-    toks = re.findall(r"\$?\d+|\$[A-Za-z_][A-Za-z0-9_]*|[+\-xX/()]", s)
+    # 数字必须带上小数点，否则 "-0.0209" 会被切成 ["-", "0", "0209"]，
+    # 小数部分整个丢掉、求值成 0——Protel/Altium 系的宏参数全是写死的小数，
+    # 一丢就是整颗芯片的焊盘全空。科学计数法也得认（repr 会给 1e-05）。
+    toks = re.findall(r"\$[A-Za-z_][A-Za-z0-9_]*|\$?" + _NUM_RE
+                      + r"|[+\-xX/()]", s)
     if not toks:
         return 0.0
     for i, t in enumerate(toks):
@@ -583,23 +601,37 @@ class GerberLayer:
             mac = self.macros.get(ap.macro_name)
             if mac is None:
                 return EMPTY
-            vals = {}
-            for i, raw in enumerate(ap.mods_raw):
-                vals[str(i + 1)] = self._eval_macro_arg(raw)
-            return mac.build(vals, tol)
+            # 宏体和 ADD 实参都在**文件单位**里，所以先按文件单位求值，
+            # 建完形状再整体换算成 mm。混着来的话，$n 出来的值是 mm、
+            # 宏里写死的小数还是英寸，同一个焊盘里两个尺度（Protel/Altium
+            # 系的宏参数全是写死的小数，实测整颗芯片小成 1/25.4）。
+            vals = {str(i + 1): self._macro_arg_raw(raw)
+                    for i, raw in enumerate(ap.mods_raw)}
+            # 容差也要按文件单位给：后面整体缩放会把误差一起放大，
+            # 英寸文件里 0.01mm 的容差喂进去，缩放完就变成 0.25mm 的棱角
+            g = mac.build(vals, tol / self.unit_scale)
+            if abs(self.unit_scale - 1.0) > 1e-12 and g is not None \
+                    and not g.is_empty:
+                g = shapely.affinity.scale(g, xfact=self.unit_scale,
+                                           yfact=self.unit_scale)
+            return g
         return EMPTY
 
-    def _eval_macro_arg(self, raw: str) -> float:
-        """ADD 里的宏实参，可能是数字也可能是 $n（引用前一个参数）"""
+    def _macro_arg_raw(self, raw: str) -> float:
+        """ADD 里的宏实参，按**文件单位**求值（不换算）"""
         raw = raw.strip()
         if not raw:
             return 0.0
         try:
-            return float(raw) * self.unit_scale
+            return float(raw)
         except ValueError:
             pass
         # $2x3 之类：按宏内表达式处理（这里的变量表来自同一 ADD 的前序参数）
-        return _eval_expr(raw, getattr(self, "_cur_macro_vars", {})) * self.unit_scale
+        return _eval_expr(raw, getattr(self, "_cur_macro_vars", {}))
+
+    def _eval_macro_arg(self, raw: str) -> float:
+        """同上，但换算到 mm（C/R/O/P 这些标准光圈用得到）"""
+        return self._macro_arg_raw(raw) * self.unit_scale
 
     # ---- 主解析 ----
     def parse(self, tol: float) -> "GerberLayer":
@@ -620,6 +652,7 @@ class GerberLayer:
         got_fs = False
         sr_warned = False
         modal_op = None            # D01/D02/D03 是模态的，见下面 op 的取法
+        flash_lost: set[int] = set()   # 已经报过"这个光圈建不出来"的光圈号
 
         def flush_region():
             nonlocal region_pts
@@ -698,6 +731,16 @@ class GerberLayer:
                     end = n
                 body = text[i + 1:end]
                 i = end + 1
+                # 孔径宏必须整块吃，不能按 * 拆开：%AMOval*图元*图元*...%
+                # 里每个图元自己就是一个 * 段，拆开之后宏就只剩个名字，
+                # 图元全丢——建出来是空形状，用它的闪光静默消失。
+                # 立创EDA 的 IC 焊盘全是圆角矩形宏，整颗芯片就这么没了。
+                if body.lstrip().upper().startswith("AM"):
+                    mm = _AM_RE.match(body.lstrip())
+                    if mm:
+                        self.macros[mm.group(1)] = Macro(
+                            mm.group(1), mm.group(2).split("*"))
+                    continue
                 for cmd in body.split("*"):
                     cmd = cmd.strip()
                     if not cmd:
@@ -748,10 +791,6 @@ class GerberLayer:
                                 self.apertures[code] = Aperture(
                                     code, "MACRO", vals, macro_name=mm.group(2),
                                     mods_raw=raws)
-                    elif up.startswith("AM"):
-                        mm = _AM_RE.match(cmd)
-                        if mm:
-                            self.macros[mm.group(1)] = Macro(mm.group(1), mm.group(2).split("*"))
                     elif up.startswith("SR"):
                         # SRX1Y1 就是"不重复"，立创每个文件都写，属正常情况不该报警
                         rep = re.match(r"SRX(\d+)Y(\d+)", up)
@@ -875,6 +914,14 @@ class GerberLayer:
                     g = self.aperture_shape(cur_ap, tol)
                     if g is not None and not g.is_empty:
                         self.items.append((polarity, self._place(g, p1), "flash"))
+                    elif cur_ap.code not in flash_lost:
+                        # 光圈建不出形状，用它的闪光就全没了。以前这里是静默
+                        # 丢弃，整颗芯片少掉都不出声——出过一次事，必须报出来。
+                        flash_lost.add(cur_ap.code)
+                        what = (f"宏 {cur_ap.macro_name}" if cur_ap.kind == "MACRO"
+                                else f"{cur_ap.kind} 形光圈")
+                        warn(f"{self.name}: 光圈 D{cur_ap.code}（{what}）"
+                             f"建不出形状，用它的锡膏开孔被整批跳过")
 
             cx, cy = nx, ny
 
@@ -2412,6 +2459,15 @@ G01*
 %ADD11R,1.200000X0.900000*%
 %ADD12O,1.600000X0.800000*%
 %ADD13C,0.300000*%
+%AMRoundRect*1,1,$1,$2,$3*1,1,$1,$4,$5*1,1,$1,0-$2,0-$3*1,1,$1,0-$4,0-$5*20,1,$1,$2,$3,$4,$5,0*20,1,$1,$4,$5,0-$2,0-$3,0*20,1,$1,0-$2,0-$3,0-$4,0-$5,0*20,1,$1,0-$4,0-$5,$2,$3,0*4,1,4,$2,$3,$4,$5,0-$2,0-$3,0-$4,0-$5,$2,$3,0*%
+%AMOval*1,1,$1,$2,$3*1,1,$1,$4,$5*20,1,$1,$2,$3,$4,$5,0*%
+%ADD14RoundRect,0.1X-0.35X0.15X0.35X0.15*%
+%ADD15Oval,0.3X0X-0.4X0X0.4*%
+D14*
+X5000000Y12000000D03*
+X5600000Y12000000D03*
+D15*
+X8000000Y12000000D03*
 D10*
 X5000000Y5000000D03*
 X5500000Y5000000D03*
