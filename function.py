@@ -93,7 +93,7 @@ except Exception as exc:  # pragma: no cover
 # 0. 日志
 # ============================================================================
 APP_TITLE = "PCB 钢网 + 治具 生成器"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1.1"          # 跟 git tag 同步，报 bug 时报的就是这个号
 
 LOG: list[str] = []
 
