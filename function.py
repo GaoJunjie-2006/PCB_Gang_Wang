@@ -144,7 +144,10 @@ class Params:
     board_clearance: float = 0.20     # 板框与治具空腔的单边间隙
     # --- 开孔规则 ---
     hole_clearance: float = 0.15      # 打穿孔禁布区外扩（半径方向）
-    hole_policy: str = "drop"         # drop=整孔删除 / clip=只裁掉孔位
+    hole_policy: str = "clip"         # clip=只挖掉孔位（默认）/ drop=整孔删除
+    via_dia: float = 0.40             # ≤该直径的孔算过孔，不参与避让：
+                                      # 盘中孔（焊盘里有散热过孔）的焊盘要保住，
+                                      # 不能因为焊盘里穿了过孔就把整个焊盘删掉
     min_aperture: float = 0.15        # 小于该宽度的开孔直接剔除（0=不过滤）
     aperture_offset: float = 0.0      # 开孔补偿，正=开孔变大（FDM 打孔偏小可填 0.05~0.1）
     # --- 精度 / 输出 ---
@@ -262,13 +265,27 @@ def signed_area(coords) -> float:
 
 
 def min_dimension(poly: Polygon) -> float:
-    """开孔最小宽度（用最小外接旋转矩形的短边近似）"""
+    """开孔的最小可印宽度 = 最大内切圆直径。
+
+    不能只用最小外接矩形：焊盘中间被挖掉一块之后是个环，外接矩形还是整个
+    焊盘那么大（1.8x1.2），可壁只剩 0.05mm——外接矩形永远看不出这种薄壁，
+    结果就是一条印不出来的细环被当成合格开孔，还把里面那块料围成孤岛。
+    最大内切圆对环形、C 形都能正确给出壁厚。
+    """
     try:
-        r = poly.minimum_rotated_rectangle
-        c = list(r.exterior.coords)[:4]
-        s1 = math.dist(c[0], c[1])
-        s2 = math.dist(c[1], c[2])
-        return min(s1, s2)
+        if poly is None or poly.is_empty or poly.area <= 0:
+            return 0.0
+        # 内切圆半径不可能超过 sqrt(面积/π)，拿它当上界
+        lo, hi = 0.0, math.sqrt(poly.area / math.pi)
+        if not poly.buffer(-hi).is_empty:
+            return 2.0 * hi
+        for _ in range(20):                      # 2^-20 的精度，够用了
+            mid = (lo + hi) / 2.0
+            if poly.buffer(-mid).is_empty:
+                hi = mid
+            else:
+                lo = mid
+        return 2.0 * lo
     except Exception:
         return float("nan")
 
@@ -1045,12 +1062,16 @@ class ExcellonLayer:
                 best, best_score = b, score
         return best
 
-    def geometry(self, tol: float):
-        """返回 (钻孔多边形列表, 每个孔的bbox) """
+    def geometry(self, tol: float, min_dia: float = 0.0):
+        """返回钻孔多边形列表。只返回直径 > min_dia 的孔——
+        比它小的当做过孔（盘中孔），要留给焊盘，不能拿来做避让。"""
         geoms = []
         for x, y, d in self.hits:
-            geoms.append(circle(x, y, d / 2.0, tol))
+            if d > min_dia:
+                geoms.append(circle(x, y, d / 2.0, tol))
         for p1, p2, d in self.slots:
+            if d <= min_dia:
+                continue
             r = d / 2.0
             if math.dist(p1, p2) < 1e-9:
                 geoms.append(circle(p1[0], p1[1], r, tol))
@@ -1058,6 +1079,12 @@ class ExcellonLayer:
                 geoms.append(LineString([p1, p2]).buffer(
                     r, cap_style=1, quad_segs=quad_segs_for(r, tol)))
         return geoms
+
+    def dia_counts(self, via_dia: float):
+        """返回 (过孔数, 真孔数)：直径 ≤ via_dia 的算过孔，不参与避让"""
+        n_via = (sum(1 for _, _, d in self.hits if d <= via_dia)
+                 + sum(1 for _, _, d in self.slots if d <= via_dia))
+        return n_via, len(self.hits) + len(self.slots) - n_via
 
 
 # ============================================================================
@@ -1421,28 +1448,36 @@ def run_job(input_path: str, params: Params) -> JobResult:
 
     # ---- 钻孔（打穿孔禁布区）----
     hole_geoms = []
-    n_hits = 0
+    n_hits = n_via = 0
     for dp in drill_paths:
         ex = ExcellonLayer(dp).parse(tol)
-        gs = ex.geometry(tol)
-        if not gs:
+        gs = ex.geometry(tol, min_dia=params.via_dia)
+        if not ex.hits and not ex.slots:
             log(f"      跳过 {os.path.basename(dp)}：里面没有钻孔数据")
             continue
         for w in ex.warnings:
             warn(w)
+        n_via += ex.dia_counts(params.via_dia)[0]
         n_hits += len(gs)
         hole_geoms.extend(gs)
         dias = sorted({round(d, 3) for _, _, d in ex.hits})
-        log(f"      钻孔 {os.path.basename(dp)}: {len(gs)} 孔，"
-            f"刀具 {len(dias)} 种，直径 {dias[:8]}{'...' if len(dias) > 8 else ''} mm")
-    log(f"\n[3/6] 打穿孔屏蔽：共 {n_hits} 个孔，禁布区外扩 {params.hole_clearance:.2f}mm")
+        log(f"      钻孔 {os.path.basename(dp)}: {len(ex.hits)} 孔 + "
+            f"{len(ex.slots)} 槽，刀具 {len(dias)} 种，"
+            f"直径 {dias[:8]}{'...' if len(dias) > 8 else ''} mm")
+
+    log(f"\n[3/6] 打穿孔屏蔽：{n_hits} 个真孔，禁布区外扩 "
+        f"{params.hole_clearance:.2f}mm")
+    log(f"      ⌀{params.via_dia:.2f}mm 及以下按过孔处理，不参与避让"
+        f"（{n_via} 个，盘中孔焊盘因此得以保留）")
 
     holes = U(hole_geoms) if hole_geoms else EMPTY
     hole_zone = holes.buffer(params.hole_clearance, quad_segs=8) if not holes.is_empty else EMPTY
 
     # ---- 开孔过滤 ----
+    # clip：只把孔位那一块挖掉，焊盘其余部分留着。插件孔上不会有锡膏开孔
+    # （锡膏层本来就不含插件焊盘），真正会撞上的是盘中孔——那种焊盘要保留。
     kept, dropped, clipped = [], [], 0
-    small = []
+    small, whole = [], []
     for g in flashes + regions:
         gg = g
         if params.aperture_offset:
@@ -1459,16 +1494,40 @@ def run_job(input_path: str, params: Params) -> JobResult:
                 continue
             gg2 = D(gg, hole_zone)
             if gg2.is_empty or gg2.area < gg.area * 0.02:
-                dropped.append(gg)
+                dropped.append(gg)           # 孔把焊盘吃光了，没东西可留
                 continue
-            clipped += 1
-            gg = gg2
+            # 细到印不出来的边不算数：环形焊盘的壁只剩几十微米时，
+            # 留着也印不出来，还会把里面那块料围成会掉的孤岛
+            parts = [p for p in polys_of(gg2)
+                     if params.min_aperture <= 0
+                     or min_dimension(p) >= params.min_aperture]
+            if len(parts) == 1 and parts[0].area >= gg.area * 0.02:
+                clipped += 1
+                gg = parts[0]                # 挖掉孔位，焊盘其余部分留着
+            else:
+                # 挖完碎成好几块、或只剩一条印不出来的细环：硬裁没有意义。
+                # 用户要的是"排孔不排焊盘"，这种情况整个焊盘原样保留
+                whole.append(gg)
         kept.append(gg)
 
     log(f"      开孔总数 {len(flashes) + len(regions)}")
-    log(f"      因打穿孔删除 {len(dropped)} 个"
-        f"{'（策略：整孔删除）' if params.hole_policy == 'drop' else '（策略：裁剪）'}"
-        + (f"，裁剪 {clipped} 个" if clipped else ""))
+    if params.hole_policy == "drop":
+        log(f"      因压在插件孔上整孔删除 {len(dropped)} 个")
+    else:
+        log(f"      被插件孔挖掉孔位、焊盘保留 {clipped} 个")
+        if whole:
+            log(f"      挖不动、整个焊盘原样保留 {len(whole)} 个"
+                f"（孔比焊盘还宽，挖了只剩印不出来的细边）")
+            for w in sorted(whole, key=lambda q: q.area)[:8]:
+                c = w.representative_point()
+                b = w.bounds
+                log(f"        {b[2] - b[0]:.2f} x {b[3] - b[1]:.2f} 焊盘 "
+                    f"({c.x:.2f}, {c.y:.2f}) 锡膏会印到孔上")
+            warn(f"有 {len(whole)} 个焊盘压在插件孔/槽孔上，挖掉孔位就只剩"
+                 f"印不出来的细边，按“保留焊盘”原样留着了。"
+                 f"这几处锡膏会漏进孔里，介意的话用 --hole-policy drop 整孔删掉")
+        if dropped:
+            log(f"      挖完不剩什么、整块放弃 {len(dropped)} 个")
     if small:
         log(f"      因小于 {params.min_aperture}mm 剔除 {len(small)} 个"
             f"（最小 {min(small):.3f}mm）")
@@ -2019,24 +2078,26 @@ def face_triangles(verts, idx, z: float, up: bool = True) -> list:
     return out
 
 
-def wall_triangles(poly: Polygon, z0: float, z1: float) -> list:
-    """侧面墙：沿外环(逆时针)与内环(顺时针)生成四边形，法线朝外"""
+def wall_triangles(poly, z0: float, z1: float) -> list:
+    """侧面墙：沿外环(逆时针)与内环(顺时针)生成四边形，法线朝外。
+    poly 可能是 MultiPolygon（开孔把料切成几块了），逐块处理。"""
     out = []
-    poly_o = orient(poly, 1.0)
-    for r in [poly_o.exterior] + list(poly_o.interiors):
-        cs = list(r.coords)[:-1]
-        m = len(cs)
-        for i in range(m):
-            x1, y1 = cs[i]
-            x2, y2 = cs[(i + 1) % m]
-            if abs(x1 - x2) < 1e-9 and abs(y1 - y2) < 1e-9:
-                continue
-            v00 = (x1, y1, z0)
-            v10 = (x2, y2, z0)
-            v11 = (x2, y2, z1)
-            v01 = (x1, y1, z1)
-            out.append((v00, v10, v11))
-            out.append((v00, v11, v01))
+    for part in polys_of(poly):
+        poly_o = orient(part, 1.0)
+        for r in [poly_o.exterior] + list(poly_o.interiors):
+            cs = list(r.coords)[:-1]
+            m = len(cs)
+            for i in range(m):
+                x1, y1 = cs[i]
+                x2, y2 = cs[(i + 1) % m]
+                if abs(x1 - x2) < 1e-9 and abs(y1 - y2) < 1e-9:
+                    continue
+                v00 = (x1, y1, z0)
+                v10 = (x2, y2, z0)
+                v11 = (x2, y2, z1)
+                v01 = (x1, y1, z1)
+                out.append((v00, v10, v11))
+                out.append((v00, v11, v01))
     return out
 
 
@@ -2561,6 +2622,7 @@ def run_gui(smoke_input: str | None = None):  # pragma: no cover
         ("治具壁厚 mm", "jig_wall"),
         ("板框间隙 mm", "board_clearance"),
         ("孔避让 mm", "hole_clearance"),
+        ("过孔阈值 mm", "via_dia"),
         ("最小开孔 mm", "min_aperture"),
         ("开孔补偿 mm", "aperture_offset"),
         ("圆弧精度 mm", "arc_tolerance"),
@@ -2578,11 +2640,11 @@ def run_gui(smoke_input: str | None = None):  # pragma: no cover
 
     opt = ttk.Frame(root, padding=(8, 0))
     opt.pack(fill="x")
-    var_hole = tk.StringVar(value="drop")
-    ttk.Label(opt, text="打穿孔处理:").pack(side="left")
+    var_hole = tk.StringVar(value=P.hole_policy)
+    ttk.Label(opt, text="压在孔上的开孔:").pack(side="left")
+    ttk.Radiobutton(opt, text="只挖掉孔位（留焊盘）", variable=var_hole,
+                    value="clip", command=on_option_change).pack(side="left")
     ttk.Radiobutton(opt, text="整孔删除", variable=var_hole, value="drop",
-                    command=on_option_change).pack(side="left")
-    ttk.Radiobutton(opt, text="只裁掉孔位", variable=var_hole, value="clip",
                     command=on_option_change).pack(side="left")
     var_layer = tk.StringVar(value="top")
     ttk.Label(opt, text="   钢网面:").pack(side="left")
@@ -2820,7 +2882,11 @@ def build_argparser():
     ap.add_argument("--jig-wall", type=float, default=5.0, help="治具壁厚 mm")
     ap.add_argument("--clearance", type=float, default=0.20, help="板框间隙 mm")
     ap.add_argument("--hole-clearance", type=float, default=0.15, help="打穿孔禁布区外扩 mm")
-    ap.add_argument("--hole-policy", choices=["drop", "clip"], default="drop")
+    ap.add_argument("--hole-policy", choices=["drop", "clip"], default="clip",
+                    help="clip=只挖掉孔位、焊盘保留（默认）/ drop=整孔删除")
+    ap.add_argument("--via-dia", type=float, default=0.40,
+                    help="≤该直径的孔算过孔，不参与避让（默认 0.40）："
+                         "盘中孔焊盘要保住")
     ap.add_argument("--min-aperture", type=float, default=0.15)
     ap.add_argument("--offset", type=float, default=0.0, help="开孔补偿 mm")
     ap.add_argument("--arc-tol", type=float, default=0.01)
@@ -2875,6 +2941,7 @@ def main(argv=None):
         stencil_thickness=args.stencil, board_thickness=args.board,
         jig_wall=args.jig_wall, board_clearance=args.clearance,
         hole_clearance=args.hole_clearance, hole_policy=args.hole_policy,
+        via_dia=args.via_dia,
         min_aperture=args.min_aperture, aperture_offset=args.offset,
         arc_tolerance=args.arc_tol, layer=args.layer,
         include_jig=not args.no_jig, flip_for_print=not args.no_flip,
