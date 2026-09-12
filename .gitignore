@@ -1,0 +1,16 @@
+# PyInstaller 打包中间产物：纯缓存，重新打包会自动重建，不进仓库
+build/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 跑出来的钢网/治具文件：默认输出目录，属于产物不是源码
+stencil_out/
+output/
+
+# 编辑器/系统杂项
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
