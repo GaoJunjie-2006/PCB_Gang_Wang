@@ -1072,6 +1072,30 @@ def _content_kind(head: str) -> str:
     return ""
 
 
+# 正反面判据。按"词"匹配而不是子串匹配：KiCad 把底层钢网叫 B_Paste.gbr，
+# 分隔符在 b 后面，老代码只找 "_b_"/"-b_" 之类，一个都对不上，
+# 结果底层被判成顶层——而且 B_ 按字母序还排在 F_ 前面，取第一个就真拿错了层。
+_SIDE_BOT = {"b", "bot", "bottom", "back", "l2", "l4",
+             "gbp", "gbo", "gbs", "gbl", "gb"}
+_SIDE_TOP = {"f", "top", "front", "l1", "l3",
+             "gtp", "gto", "gts", "gtl", "gt"}
+
+
+def _layer_side(name: str) -> str | None:
+    """从文件名判断是正面还是反面，判不出来返回 None"""
+    low = name.lower()
+    for tok in re.split(r"[^a-z0-9一-鿿]+", low):
+        if tok in _SIDE_BOT:
+            return "bottom"
+        if tok in _SIDE_TOP:
+            return "top"
+    if "bottom" in low or "背面" in name or "底层" in name or "底" in name:
+        return "bottom"
+    if "top" in low or "正面" in name or "顶层" in name or "顶" in name:
+        return "top"
+    return None
+
+
 def classify_by_attribute(path: str, head: str | None = None) -> str | None:
     """优先用文件里的 X2 属性判层（比文件名可靠，AD/KiCad/立创新版本都会写）。
 
@@ -1144,9 +1168,7 @@ def classify_file(path: str) -> str:
         return "outline"
     # 钢网（锡膏层）
     if has("paste", "gtp", "gbp", "锡膏", "钢网"):
-        if has("bottom", "gbp", "_b_", "-b_", "bot"):
-            return "paste_bottom"
-        return "paste_top"
+        return "paste_bottom" if _layer_side(n) == "bottom" else "paste_top"
     if ext == ".gtp":
         return "paste_top"
     if ext == ".gbp":
@@ -1231,8 +1253,17 @@ def pick_files(found: dict[str, list[str]], layer: str) \
     cn = {"top": "顶层", "bottom": "底层"}
 
     def _pick(kind: str) -> str | None:
-        lst = found.get(f"paste_{kind}", [])
-        return lst[0] if lst else None
+        """同一类里挑一个。多候选时必须说清楚挑了哪个：
+        导出目录里同时有顶层和底层钢网时，不吭声地取第一个等于让用户猜。"""
+        lst = sorted(found.get(f"paste_{kind}", []))       # 排序，保证结果可复现
+        if not lst:
+            return None
+        if len(lst) > 1:
+            warn(f"！！ 找到 {len(lst)} 个{cn[kind]}锡膏层文件，将使用第一个，"
+                 f"其余的忽略：")
+            for i, fp in enumerate(lst):
+                warn(f"！！   {'→' if i == 0 else ' '} {os.path.basename(fp)}")
+        return lst[0]
 
     p_top, p_bot = _pick("top"), _pick("bottom")
     used = layer
@@ -1249,19 +1280,26 @@ def pick_files(found: dict[str, list[str]], layer: str) \
         raise JobError("没有找到钢网层（锡膏层）。请确认导出了 Paste 层：\n"
                        "  Altium: *.GTP / *.GBP\n"
                        "  立创EDA: Gerber_TopPasteLayer.GTP / Gerber_BottomPasteLayer.GBP\n"
-                       "  KiCad : *-F_Paste.gbr / *-B_Paste.gbr")
+                       "  KiCad : *-F_Paste.gbr / *-B_Paste.gbr\n"
+                       "  通用 : 文件名里带 paste/锡膏/钢网 等字样，或用 X2 格式导出\n"
+                       "         （只叫 layer1.gbr 这种，文件里外都没层信息，认不出来）")
     if used != layer:
         warn(f"！！ 没有找到{cn[layer]}锡膏层，已改用{cn[used]}："
              f"{os.path.basename(paste)}")
         warn(f"！！ 如果这块板两面都有贴片，请检查导出时是否漏了 "
              f"{'Bottom/GBP' if layer == 'bottom' else 'Top/GTP'} 层")
 
-    outlines = found.get("outline", [])
+    outlines = sorted(found.get("outline", []))
     if not outlines:
         raise JobError("没有找到板框层。请确认导出了 Outline/Keepout 层：\n"
                        "  Altium: *.GKO / *.GM1\n"
                        "  立创EDA: Gerber_BoardOutlineLayer.GKO\n"
-                       "  KiCad : *-Edge_Cuts.gbr")
+                       "  KiCad : *-Edge_Cuts.gbr\n"
+                       "  通用 : 文件名里带 outline/edge_cuts/板框 等字样")
+    if len(outlines) > 1:
+        warn(f"！！ 找到 {len(outlines)} 个板框文件，将使用第一个：")
+        for i, fp in enumerate(outlines):
+            warn(f"！！   {'→' if i == 0 else ' '} {os.path.basename(fp)}")
     drills = (found.get("drill", []) + found.get("drill_pth", [])
               + found.get("drill_npth", []))
     return paste, outlines[0], drills, used
