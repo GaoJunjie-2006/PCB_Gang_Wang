@@ -1144,9 +1144,12 @@ def classify_file(path: str) -> str:
     n = os.path.basename(path).lower()
     stem, ext = os.path.splitext(n)
     kind = _content_kind(head)
+    # 再去掉一切分隔符留一份。Altium 不勾 "Use Protel filename extensions" 导出的是
+    # "MyBoard-Keep-Out Layer.gbr"，层名里的空格连字符都在，直接找 "keepout" 对不上。
+    flat = re.sub(r"[^a-z0-9一-鿿]+", "", n)
 
     def has(*keys):
-        return any(k in n for k in keys)
+        return any(k in n or k in flat for k in keys)
 
     # 钻孔：名字像钻孔还不够，内容也得是 Excellon。
     # Gerber 格式的"钻孔图"(DrillDrawing/GDD) 只是示意图，不是钻孔数据；
@@ -1162,10 +1165,15 @@ def classify_file(path: str) -> str:
         if has("pth", "plated"):
             return "drill_pth"
         return "drill"
-    # 板框
+    # 板框。Keep-Out 就是 AD 里画板子形状的那层，中文版叫"禁止布线层"
     if has("outline", "edge_cuts", "edgecuts", "boardoutline", "board_outline",
-           "gko", "gm1", "gml", "keepout", "border", "板框"):
+           "gko", "keepout", "border", "板框", "禁止布线"):
         return "outline"
+    # 机械层：AD 官方也建议拿它画板框，但机械层上同样可能画的是尺寸标注、
+    # 装配图，所以单独归一类，只有找不到正经板框时才拿来顶。
+    # 只认"机械层"不认"机械"，免得"机械孔"这种被当成板框。
+    if has("gm1", "gml", "mechanical", "机械层"):
+        return "outline_weak"
     # 钢网（锡膏层）
     if has("paste", "gtp", "gbp", "锡膏", "钢网"):
         return "paste_bottom" if _layer_side(n) == "bottom" else "paste_top"
@@ -1291,8 +1299,18 @@ def pick_files(found: dict[str, list[str]], layer: str) \
 
     outlines = sorted(found.get("outline", []))
     if not outlines:
-        raise JobError("没有找到板框层。请确认导出了 Outline/Keepout 层：\n"
-                       "  Altium: *.GKO / *.GM1\n"
+        # 只有机械层可用时凑合用，但得让用户知道用的是哪个、可能要担什么风险
+        weak = sorted(found.get("outline_weak", []))
+        if weak:
+            warn(f"！！ 没有找到 Keep-Out / Edge_Cuts 这类明确的板框层，"
+                 f"改用机械层：{os.path.basename(weak[0])}")
+            warn(f"！！ 机械层上如果画的是尺寸标注、装配图之类，板子外形会是错的。"
+                 f"建议改用 Keep-Out 层（中文版叫禁止布线层）重导一次")
+            outlines = weak
+
+    if not outlines:
+        raise JobError("没有找到板框层。请确认导出了板框层：\n"
+                       "  Altium: Keep-Out Layer（禁止布线层）/ Mechanical 1 / *.GKO\n"
                        "  立创EDA: Gerber_BoardOutlineLayer.GKO\n"
                        "  KiCad : *-Edge_Cuts.gbr\n"
                        "  通用 : 文件名里带 outline/edge_cuts/板框 等字样")
@@ -2611,6 +2629,8 @@ def run_gui(smoke_input: str | None = None):  # pragma: no cover
         lines.append(f"顶层锡膏(paste_top)   : {ok('paste_top')}")
         lines.append(f"底层锡膏(paste_bottom): {ok('paste_bottom')}")
         lines.append(f"板框(outline)         : {ok('outline')}")
+        if found.get("outline_weak"):
+            lines.append(f"机械层(仅当板框用)    : {ok('outline_weak')}")
         drills = (found.get("drill", []) + found.get("drill_pth", [])
                   + found.get("drill_npth", []))
         lines.append(f"钻孔(drill)           : {'有' if drills else '—— 没有 ——'}")
