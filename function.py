@@ -602,6 +602,7 @@ class GerberLayer:
         image_negative = False
         got_fs = False
         sr_warned = False
+        modal_op = None            # D01/D02/D03 是模态的，见下面 op 的取法
 
         def flush_region():
             nonlocal region_pts
@@ -686,12 +687,20 @@ class GerberLayer:
                         continue
                     up = cmd.upper()
                     if up.startswith("FS"):
-                        mm = re.match(r"FS([LT])([AI])X(\d)(\d)Y(\d)(\d)", up)
+                        # 零省略方式：L=省略前导零 T=省略后导零 D=不省略。
+                        # D 是老规范的写法（现规范已废弃），立创EDA 至今照导，
+                        # 只认 [LT] 就会匹配失败、悄悄退到默认 3.4，坐标整体差出
+                        # 一个数量级。D 是定宽的，数值处理和 L 完全一样。
+                        mm = re.match(r"FS([LTD])([AI])X(\d)(\d)Y(\d)(\d)", up)
                         if mm:
-                            self.notation = mm.group(1)
+                            self.notation = "T" if mm.group(1) == "T" else "L"
                             self.int_digits = int(mm.group(3))
                             self.dec_digits = int(mm.group(4))
                             got_fs = True
+                            if mm.group(3) != mm.group(5) or mm.group(4) != mm.group(6):
+                                warn(f"{self.name}: X/Y 坐标位数不同"
+                                     f"（X{mm.group(3)}.{mm.group(4)} "
+                                     f"Y{mm.group(5)}.{mm.group(6)}），按 X 的位数解析")
                     elif up.startswith("MO"):
                         if "IN" in up:
                             self.unit_scale = 25.4
@@ -727,7 +736,10 @@ class GerberLayer:
                         if mm:
                             self.macros[mm.group(1)] = Macro(mm.group(1), mm.group(2).split("*"))
                     elif up.startswith("SR"):
-                        if not sr_warned:
+                        # SRX1Y1 就是"不重复"，立创每个文件都写，属正常情况不该报警
+                        rep = re.match(r"SRX(\d+)Y(\d+)", up)
+                        if not (rep and rep.group(1) == "1" and rep.group(2) == "1") \
+                                and not sr_warned:
                             warn(f"{self.name}: 含 SR 步进重复指令，暂不支持，按单图形处理")
                             sr_warned = True
                     elif up.startswith("TF"):
@@ -808,7 +820,12 @@ class GerberLayer:
                 elif k == "J":
                     jj = self._coord(v)
 
-            op = d_code if d_code in (1, 2, 3) else None
+            # D01/D02/D03 是模态的：坐标块里不写 D 码就沿用上一次的操作。
+            # 立创EDA 的板框真的这么省——"X0324000*" 光有坐标，意思就是画一条边。
+            # 只认字面出现的 D 码，这条边会被整条丢掉，板框就闭合不了。
+            if d_code in (1, 2, 3):
+                modal_op = d_code
+            op = modal_op
             p0 = (cx, cy)
             p1 = (nx, ny)
 
